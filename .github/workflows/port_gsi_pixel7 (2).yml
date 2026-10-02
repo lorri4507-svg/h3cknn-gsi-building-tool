@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       rom_url:
-        description: "📥 Direct URL to the GSI (.img.xz / .img)"
+        description: "📥 Direct URL to Lunaris GSI (.img.xz / .img)"
         required: true
         type: string
         default: "https://github.com/Doze-off/Lunaris-AOSP_gsi/releases/download/2026-09-20/Lunaris-3.12-GSI_treble_arm64-ab-GAPPS-Official-20260920.img.xz"
@@ -13,65 +13,66 @@ on:
       output_name:
         description: "📛 Output GSI name"
         required: true
-        default: "Lunaris_Pixel7_eSIM_Lockscreen_GSI"
         type: string
+        default: "Lunaris_Pixel7_eSIM_Lockscreen_GSI"
 
       fs_type:
         description: "💾 Output filesystem"
         required: true
-        default: "ext4"
         type: choice
+        default: "ext4"
         options:
-          - "ext4"
-          - "erofs"
-
-      require_esim_stack:
-        description: "📶 Fail if no eUICC/eSIM stack is present"
-        required: true
-        default: true
-        type: boolean
+          - ext4
+          - erofs
 
       factory_image_url:
-        description: "📱 Matching Pixel 7 panther factory ZIP"
+        description: "📱 Pixel 7 panther factory ZIP"
         required: false
-        default: "https://dl.google.com/dl/android/aosp/panther-bp4a.251205.006-factory-4455f800.zip"
         type: string
+        default: "https://dl.google.com/dl/android/aosp/panther-bp4a.251205.006-factory-4455f800.zip"
+
+      require_esim_stack:
+        description: "📶 Fail if no eUICC stack is present"
+        required: true
+        type: boolean
+        default: true
 
       inject_stock_euicc:
-        description: "📶 Inject Google Pixel eUICC apps from stock"
+        description: "📶 Add stock Pixel eUICC apps only if missing"
         required: true
-        default: true
         type: boolean
+        default: true
 
       inject_stock_compat:
-        description: "🔐 Inject targeted stock Pixel permissions/sysconfig/biometric/credential compatibility files"
+        description: "🔐 Inject targeted Pixel permission/sysconfig/biometric compatibility"
         required: true
-        default: true
         type: boolean
+        default: true
 
       inject_stock_overlays:
-        description: "🎨 Try targeted Pixel stock overlays for lockscreen/biometric/resource compatibility"
+        description: "🎨 Inject selected Pixel RRO overlays"
         required: true
-        default: true
         type: boolean
+        default: true
 
       include_vendor_images:
-        description: "🧩 Bundle matching stock vendor/ODM/DLKM/security firmware"
+        description: "🧩 Bundle stock Pixel vendor/security/kernel images"
         required: true
-        default: true
         type: boolean
+        default: true
 
       custom_kernel_boot_url:
         description: "🧬 Optional custom panther boot.img"
         required: false
-        default: ""
         type: string
+        default: ""
 
       wipe_userdata:
-        description: "🧹 Flash script wipes userdata (recommended for credential/KeyMint repair)"
+        description: "🧹 Flash script wipes userdata"
         required: true
-        default: true
         type: boolean
+        default: true
+
 
 jobs:
   port_gsi:
@@ -87,11 +88,22 @@ jobs:
 
     steps:
 
+      # ==============================================================
+      # CHECKOUT
+      # ==============================================================
+
       - name: "📦 Checkout Repository"
         uses: actions/checkout@v5
 
+
+      # ==============================================================
+      # FREE DISK
+      # ==============================================================
+
       - name: "🧹 Free Runner Disk Space"
         run: |
+          set -euo pipefail
+
           sudo rm -rf \
             /usr/share/dotnet \
             /usr/local/lib/android \
@@ -101,7 +113,18 @@ jobs:
             /usr/share/swift || true
 
           sudo docker image prune --all --force || true
+
           df -h /
+
+
+      # ==============================================================
+      # DEPENDENCIES
+      #
+      # IMPORTANT:
+      # There is NO "python3-xml" Ubuntu package required here.
+      #
+      # xml.etree.ElementTree is included with Python 3 itself.
+      # ==============================================================
 
       - name: "⚙️ Install Dependencies"
         run: |
@@ -110,6 +133,7 @@ jobs:
           sudo apt-get update
 
           sudo apt-get install -y \
+            curl \
             xz-utils \
             android-sdk-libsparse-utils \
             e2fsprogs \
@@ -121,12 +145,23 @@ jobs:
             unzip \
             zip \
             python3 \
-            python3-xml \
-            jq
+            jq \
+            lz4 \
+            zstd \
+            bc \
+            p7zip-full
 
-      # ================================================================
-      # STOCK PIXEL 7
-      # ================================================================
+          python3 - <<'PY'
+          import xml.etree.ElementTree
+          print("Python XML support: OK")
+          PY
+
+          df -h /
+
+
+      # ==============================================================
+      # DOWNLOAD PIXEL FACTORY IMAGE
+      # ==============================================================
 
       - name: "📥 Fetch Pixel 7 Stock Firmware"
         env:
@@ -138,30 +173,31 @@ jobs:
           F="$W/factory"
 
           mkdir -p "$F"
-          cd "$F"
 
           if [ -z "$FACTORY_URL" ]; then
-            echo "::warning::No factory_image_url supplied."
+            echo "::warning::No factory image supplied."
             exit 0
           fi
 
+          cd "$F"
+
           curl -fL \
-            --retry 5 \
+            --retry 8 \
             --retry-delay 5 \
             --retry-all-errors \
             -o factory.zip \
             "$FACTORY_URL"
 
-          EXPECTED=$(
+          EXPECTED="$(
             basename "${FACTORY_URL%%\?*}" |
             sed -nE 's/.*-factory-([0-9a-f]{8})\.zip$/\1/p'
-          )
+          )"
 
           if [ -n "$EXPECTED" ]; then
-            ACTUAL=$(sha256sum factory.zip | cut -c1-8)
+            ACTUAL="$(sha256sum factory.zip | cut -c1-8)"
 
             if [ "$ACTUAL" != "$EXPECTED" ]; then
-              echo "::error::Factory image checksum mismatch."
+              echo "::error::Factory ZIP checksum mismatch."
               echo "Expected: $EXPECTED"
               echo "Actual:   $ACTUAL"
               exit 1
@@ -173,38 +209,49 @@ jobs:
           unzip -q factory.zip -d fx
           rm -f factory.zip
 
-          IMGZIP=$(find fx -name 'image-panther-*.zip' | head -n1)
+          IMGZIP="$(find fx -name 'image-panther-*.zip' | head -n1)"
 
           if [ -z "$IMGZIP" ]; then
             echo "::error::No image-panther-*.zip found."
-            echo "The supplied factory image is not a Pixel 7 panther factory image."
             exit 1
           fi
 
           unzip -q "$IMGZIP" -d img
+
           rm -rf fx
 
-          echo "::group::Stock Pixel images"
-          find img -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+          echo "::group::Pixel 7 stock images"
+
+          find img \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f %s bytes\n' |
+            sort
+
           echo "::endgroup::"
 
-      # ================================================================
+
+      # ==============================================================
       # EXTRACT STOCK COMPATIBILITY MATERIAL
       #
-      # IMPORTANT:
-      # We deliberately DO NOT replace Lunaris SystemUI/framework.
-      # Those APK/JARs can be tightly coupled to the GSI.
+      # DO NOT replace:
+      #   framework-res.apk
+      #   SystemUI.apk
+      #   services.jar
+      #   framework.jar
       #
-      # Instead we pull:
-      #   - permissions
-      #   - sysconfig
-      #   - Pixel feature declarations
-      #   - biometric/credential configuration
-      #   - selected overlays
-      #   - eUICC
-      # ================================================================
+      # Those are tightly coupled to the Lunaris build.
+      #
+      # Instead extract targeted:
+      #   permissions
+      #   sysconfig
+      #   biometric configuration
+      #   credential configuration
+      #   Pixel overlays
+      #   eUICC
+      # ==============================================================
 
-      - name: "🔐 Extract Pixel Stock Compatibility Layer"
+      - name: "🔐 Extract Pixel Compatibility Layer"
         env:
           INJECT_EUICC: ${{ inputs.inject_stock_euicc }}
           INJECT_COMPAT: ${{ inputs.inject_stock_compat }}
@@ -224,12 +271,18 @@ jobs:
           fi
 
           hex_at() {
-            dd if="$1" bs=1 skip="$2" count="$3" 2>/dev/null | xxd -p
+            dd if="$1" \
+              bs=1 \
+              skip="$2" \
+              count="$3" \
+              2>/dev/null |
+              xxd -p
           }
 
           mount_stock() {
             local IMG="$1"
             local NAME="$2"
+
             local RAW="$F/${NAME}.raw"
             local MNT="$F/mnt_${NAME}"
 
@@ -240,7 +293,10 @@ jobs:
               IMG="$RAW"
             fi
 
-            if sudo mount -o loop,ro,noload "$IMG" "$MNT" 2>/dev/null; then
+            if sudo mount \
+                -o loop,ro,noload \
+                "$IMG" "$MNT" 2>/dev/null; then
+
               echo "$MNT"
               return 0
             fi
@@ -249,7 +305,1518 @@ jobs:
             return 1
           }
 
-          cleanup_mount() {
+          unmount_stock() {
             local MNT="$1"
 
-            sudo umount "$MNT" 2>/dev/null
+            sudo umount "$MNT" 2>/dev/null || true
+            rm -rf "$MNT"
+          }
+
+          copy_tree() {
+            local SRC="$1"
+            local DST="$2"
+
+            if [ -d "$SRC" ]; then
+              mkdir -p "$DST"
+
+              sudo rsync \
+                -a \
+                --numeric-ids \
+                "$SRC"/ \
+                "$DST"/
+            fi
+          }
+
+          for part in system system_ext product; do
+
+            IMG="$F/img/$part.img"
+
+            [ -f "$IMG" ] || continue
+
+            MNT="$(mount_stock "$IMG" "$part")" || {
+              echo "::warning::Could not mount $part.img"
+              continue
+            }
+
+            echo "::group::Inspecting stock $part"
+
+            BASE="$MNT"
+
+            if [ "$part" = "system" ] &&
+               [ -d "$MNT/system" ]; then
+              BASE="$MNT/system"
+            fi
+
+            echo "Base: $BASE"
+
+            # --------------------------------------------------------
+            # PERMISSIONS
+            # --------------------------------------------------------
+
+            if [ "$INJECT_COMPAT" = "true" ]; then
+
+              mkdir -p "$C/$part/etc/permissions"
+
+              # Hardware feature declarations related to biometrics,
+              # secure authentication and Pixel telephony.
+              find "$BASE/etc/permissions" \
+                -maxdepth 1 \
+                -type f \
+                \( \
+                  -iname '*biometric*' \
+                  -o -iname '*fingerprint*' \
+                  -o -iname '*face*' \
+                  -o -iname '*secure*' \
+                  -o -iname '*euicc*' \
+                  -o -iname '*telephony*' \
+                \) \
+                -exec cp -a {} "$C/$part/etc/permissions/" \; \
+                2>/dev/null || true
+
+              # Extract only Pixel/eUICC/biometric privapp entries.
+              python3 - \
+                "$BASE/etc/permissions" \
+                "$C/$part/etc/permissions/stock-selected-privapp.xml" <<'PY'
+          import sys
+          import glob
+          import os
+          import xml.etree.ElementTree as ET
+
+          src, dst = sys.argv[1:3]
+
+          wanted = (
+              "euicc",
+              "biometric",
+              "fingerprint",
+              "face",
+              "pixel",
+              "keymint",
+              "gatekeeper",
+          )
+
+          out = ET.Element("permissions")
+          count = 0
+
+          for path in sorted(
+              glob.glob(os.path.join(src, "privapp-permissions*.xml"))
+          ):
+              try:
+                  root = ET.parse(path).getroot()
+              except Exception:
+                  continue
+
+              for node in root.iter("privapp-permissions"):
+                  package = node.get("package", "").lower()
+
+                  if any(x in package for x in wanted):
+                      out.append(node)
+                      count += 1
+
+          if count:
+              os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+              ET.ElementTree(out).write(
+                  dst,
+                  encoding="utf-8",
+                  xml_declaration=True
+              )
+
+              print("Selected privapp entries:", count)
+          else:
+              print("No selected privapp entries found.")
+          PY
+
+              # ------------------------------------------------------
+              # SYSCONFIG
+              # ------------------------------------------------------
+
+              mkdir -p "$C/$part/etc/sysconfig"
+
+              find "$BASE/etc/sysconfig" \
+                -maxdepth 1 \
+                -type f \
+                \( \
+                  -iname '*pixel*' \
+                  -o -iname '*biometric*' \
+                  -o -iname '*euicc*' \
+                  -o -iname '*google*' \
+                \) \
+                -exec cp -a {} "$C/$part/etc/sysconfig/" \; \
+                2>/dev/null || true
+
+              # ------------------------------------------------------
+              # BIOMETRIC / CREDENTIAL CONFIG
+              # ------------------------------------------------------
+
+              mkdir -p "$C/$part/etc"
+
+              find "$BASE/etc" \
+                -maxdepth 2 \
+                -type f \
+                \( \
+                  -iname '*biometric*' \
+                  -o -iname '*fingerprint*' \
+                  -o -iname '*gatekeeper*' \
+                  -o -iname '*keymint*' \
+                  -o -iname '*weaver*' \
+                  -o -iname '*credential*' \
+                \) \
+                -exec cp -a {} "$C/$part/etc/" \; \
+                2>/dev/null || true
+            fi
+
+
+            # --------------------------------------------------------
+            # STOCK RRO OVERLAYS
+            #
+            # We intentionally do NOT copy framework-res/SystemUI.
+            #
+            # RROs are much safer because they are designed to modify
+            # resources without replacing the base framework package.
+            # --------------------------------------------------------
+
+            if [ "$INJECT_OVERLAYS" = "true" ]; then
+
+              mkdir -p "$C/$part/overlay"
+
+              for odir in \
+                "$BASE/overlay" \
+                "$BASE/product/overlay" \
+                "$BASE/system_ext/overlay"
+              do
+                [ -d "$odir" ] || continue
+
+                find "$odir" \
+                  -maxdepth 2 \
+                  -type f \
+                  \( \
+                    -name '*.apk' \
+                    -o -name '*.apk.idmap' \
+                  \) \
+                  -print0 |
+                while IFS= read -r -d '' apk; do
+
+                  name="$(basename "$apk")"
+                  lower="$(echo "$name" | tr '[:upper:]' '[:lower:]')"
+
+                  case "$lower" in
+                    *pixel*|*google*|*biometric*|*fingerprint*)
+                      mkdir -p "$C/$part/overlay"
+                      cp -a "$apk" "$C/$part/overlay/"
+                      echo "Selected overlay: $apk"
+                      ;;
+                  esac
+                done
+              done
+            fi
+
+
+            # --------------------------------------------------------
+            # eUICC
+            # --------------------------------------------------------
+
+            if [ "$INJECT_EUICC" = "true" ]; then
+
+              mkdir -p "$C/$part"
+
+              for root in \
+                "$BASE/priv-app" \
+                "$BASE/app"
+              do
+                [ -d "$root" ] || continue
+
+                find "$root" \
+                  -maxdepth 1 \
+                  -type d \
+                  \( \
+                    -iname '*Euicc*' \
+                    -o -iname '*eUICC*' \
+                    -o -iname '*EuiccSupportPixel*' \
+                  \) |
+                while read -r app; do
+
+                  mkdir -p "$C/$part/$(basename "$root")"
+
+                  cp -a \
+                    "$app" \
+                    "$C/$part/$(basename "$root")/"
+
+                  echo "Extracted eUICC: $app"
+                done
+              done
+
+              mkdir -p "$C/$part/etc/permissions"
+
+              find "$BASE/etc/permissions" \
+                -maxdepth 1 \
+                -type f \
+                -iname '*euicc*' \
+                -exec cp -a {} "$C/$part/etc/permissions/" \; \
+                2>/dev/null || true
+
+              mkdir -p "$C/$part/etc/sysconfig"
+
+              find "$BASE/etc/sysconfig" \
+                -maxdepth 1 \
+                -type f \
+                -iname '*euicc*' \
+                -exec cp -a {} "$C/$part/etc/sysconfig/" \; \
+                2>/dev/null || true
+            fi
+
+            echo "::endgroup::"
+
+            unmount_stock "$MNT"
+
+          done
+
+          # Remove stock ART caches.
+          find "$C" \
+            -type d \
+            \( \
+              -name oat \
+              -o -name dalvik-cache \
+            \) \
+            -prune \
+            -exec rm -rf {} + \
+            2>/dev/null || true
+
+          sudo chown -R "$USER:$USER" "$C"
+
+          echo "::group::Extracted compatibility files"
+
+          find "$C" \
+            -type f \
+            -printf '%P\n' |
+            sort
+
+          echo "::endgroup::"
+
+
+      # ==============================================================
+      # DOWNLOAD + PREPARE GSI
+      # ==============================================================
+
+      - name: "🚀 Download and Prepare Lunaris GSI"
+        env:
+          ROM_URL: ${{ inputs.rom_url }}
+          OUTPUT_NAME: ${{ inputs.output_name }}
+          FS_TYPE: ${{ inputs.fs_type }}
+          REQUIRE_ESIM: ${{ inputs.require_esim_stack }}
+          INJECT_EUICC: ${{ inputs.inject_stock_euicc }}
+          INJECT_COMPAT: ${{ inputs.inject_stock_compat }}
+          INJECT_OVERLAYS: ${{ inputs.inject_stock_overlays }}
+        run: |
+          set -euo pipefail
+
+          W="$GITHUB_WORKSPACE/workspace"
+          T="$W/tmp"
+          SRC="$W/src"
+          MNT="$W/mnt"
+          OUT="$W/output"
+
+          mkdir -p \
+            "$T" \
+            "$SRC" \
+            "$MNT" \
+            "$OUT"
+
+          cd "$T"
+
+          hex_at() {
+            dd if="$1" \
+              bs=1 \
+              skip="$2" \
+              count="$3" \
+              2>/dev/null |
+              xxd -p
+          }
+
+
+          # ----------------------------------------------------------
+          # DOWNLOAD
+          # ----------------------------------------------------------
+
+          curl -fL \
+            --retry 8 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            -o rom.download \
+            "$ROM_URL"
+
+          ls -lh rom.download
+
+
+          # ----------------------------------------------------------
+          # XZ
+          # ----------------------------------------------------------
+
+          if xz -t rom.download 2>/dev/null; then
+            xz -dc rom.download > rom.img
+          else
+            mv rom.download rom.img
+          fi
+
+          rm -f rom.download
+
+
+          # ----------------------------------------------------------
+          # SPARSE
+          # ----------------------------------------------------------
+
+          if [ "$(hex_at rom.img 0 4)" = "ed26ff3a" ]; then
+            echo "Converting sparse image..."
+
+            simg2img \
+              rom.img \
+              raw.img
+
+            mv raw.img rom.img
+          fi
+
+
+          # ----------------------------------------------------------
+          # FILESYSTEM
+          # ----------------------------------------------------------
+
+          if [ "$(hex_at rom.img 1080 2)" = "53ef" ]; then
+            SRC_FS="ext4"
+
+          elif [ "$(hex_at rom.img 1024 4)" = "e2e1f5e0" ]; then
+            SRC_FS="erofs"
+
+          else
+            echo "::error::Unknown GSI filesystem."
+            exit 1
+          fi
+
+          echo "Source filesystem: $SRC_FS"
+
+
+          # ----------------------------------------------------------
+          # COPY INTO CLEAN EXT4
+          # ----------------------------------------------------------
+
+          if [ "$SRC_FS" = "ext4" ]; then
+            sudo mount \
+              -t ext4 \
+              -o loop,ro,noload \
+              rom.img \
+              "$SRC"
+          else
+            sudo mount \
+              -t erofs \
+              -o loop,ro \
+              rom.img \
+              "$SRC"
+          fi
+
+          USED="$(sudo du -sb "$SRC" | cut -f1)"
+
+          # Extra room for injected Pixel compatibility files.
+          EXTRA=$((900 * 1024 * 1024))
+
+          IMAGE_SIZE=$((USED + USED / 5 + EXTRA))
+
+          echo "Used: $USED"
+          echo "New image size: $IMAGE_SIZE"
+
+          WORK="$T/system-working.img"
+
+          truncate \
+            -s "$IMAGE_SIZE" \
+            "$WORK"
+
+          mkfs.ext4 \
+            -q \
+            -b 4096 \
+            -L system \
+            -O ^has_journal \
+            "$WORK"
+
+          sudo mount \
+            -o loop,rw \
+            "$WORK" \
+            "$MNT"
+
+          sudo rsync \
+            -aHAX \
+            --numeric-ids \
+            "$SRC"/ \
+            "$MNT"/
+
+          sudo umount "$SRC"
+
+          rm -f rom.img
+
+
+          # ----------------------------------------------------------
+          # FIND SYSTEM ROOT
+          # ----------------------------------------------------------
+
+          if [ -f "$MNT/system/build.prop" ]; then
+            SYS="$MNT/system"
+
+          elif [ -f "$MNT/build.prop" ]; then
+            SYS="$MNT"
+
+          else
+            echo "::error::Cannot locate build.prop."
+
+            sudo find "$MNT" \
+              -maxdepth 3 \
+              -name build.prop \
+              -print
+
+            exit 1
+          fi
+
+          BP="$SYS/build.prop"
+
+          getprop_file() {
+            sudo grep -m1 "^$1=" "$BP" |
+              cut -d= -f2- ||
+              true
+          }
+
+          SDK="$(getprop_file ro.build.version.sdk)"
+          ANDROID="$(getprop_file ro.build.version.release)"
+          ABI="$(getprop_file ro.product.cpu.abilist)"
+
+          echo "Android: $ANDROID"
+          echo "SDK: $SDK"
+          echo "ABI: $ABI"
+
+          echo "$SDK" > "$W/gsi-sdk.txt"
+
+          case "$ABI" in
+            *arm64-v8a*)
+              ;;
+            *)
+              echo "::error::GSI is not ARM64."
+              exit 1
+              ;;
+          esac
+
+
+          # ==========================================================
+          # PIXEL COMPATIBILITY PATCHES
+          # ==========================================================
+
+          if [ "$INJECT_COMPAT" = "true" ]; then
+
+            echo "::group::Injecting Pixel compatibility files"
+
+            for part in system system_ext product; do
+
+              SRC_COMPAT="$W/stock-compat/$part"
+
+              [ -d "$SRC_COMPAT" ] || continue
+
+              DEST="$SYS"
+
+              case "$part" in
+                system_ext)
+                  DEST="$SYS/system_ext"
+                  ;;
+                product)
+                  DEST="$SYS/product"
+                  ;;
+              esac
+
+              sudo mkdir -p "$DEST"
+
+              # ------------------------------------------------------
+              # IMPORTANT:
+              # Do not blindly overwrite all stock files.
+              # ------------------------------------------------------
+
+              if [ -d "$SRC_COMPAT/etc/permissions" ]; then
+
+                sudo mkdir -p "$DEST/etc/permissions"
+
+                find "$SRC_COMPAT/etc/permissions" \
+                  -maxdepth 1 \
+                  -type f |
+                while read -r f; do
+
+                  name="$(basename "$f")"
+
+                  # Only install selected compatibility files.
+                  case "$name" in
+                    *biometric*|*fingerprint*|*face*|*euicc*|\
+                    *secure*|stock-selected-privapp.xml)
+                      sudo cp -a \
+                        "$f" \
+                        "$DEST/etc/permissions/$name"
+                      ;;
+                  esac
+
+                done
+              fi
+
+
+              # ------------------------------------------------------
+              # SYSCONFIG
+              # ------------------------------------------------------
+
+              if [ -d "$SRC_COMPAT/etc/sysconfig" ]; then
+
+                sudo mkdir -p "$DEST/etc/sysconfig"
+
+                find "$SRC_COMPAT/etc/sysconfig" \
+                  -maxdepth 1 \
+                  -type f |
+                while read -r f; do
+
+                  name="$(basename "$f")"
+
+                  case "$name" in
+                    *pixel*|*biometric*|*fingerprint*|*euicc*)
+                      sudo cp -a \
+                        "$f" \
+                        "$DEST/etc/sysconfig/$name"
+                      ;;
+                  esac
+
+                done
+              fi
+
+
+              # ------------------------------------------------------
+              # RRO OVERLAYS
+              # ------------------------------------------------------
+
+              if [ "$INJECT_OVERLAYS" = "true" ] &&
+                 [ -d "$SRC_COMPAT/overlay" ]; then
+
+                sudo mkdir -p "$DEST/overlay"
+
+                find "$SRC_COMPAT/overlay" \
+                  -maxdepth 1 \
+                  -type f \
+                  -name '*.apk' |
+                while read -r apk; do
+
+                  name="$(basename "$apk")"
+
+                  sudo cp -a \
+                    "$apk" \
+                    "$DEST/overlay/$name"
+
+                done
+              fi
+
+            done
+
+            echo "::endgroup::"
+          fi
+
+
+          # ==========================================================
+          # eSIM
+          # ==========================================================
+
+          echo "::group::eSIM verification"
+
+          find_euicc() {
+            sudo find "$MNT" \
+              -maxdepth 8 \
+              \( \
+                -iname 'EuiccGoogle*' \
+                -o -iname 'EuiccSupportPixel*' \
+              \) \
+              -not -path '*/lib/*' \
+              -not -path '*/lib64/*' |
+              head -30 ||
+              true
+          }
+
+          EUICC="$(find_euicc)"
+
+          echo "Existing eUICC:"
+          echo "${EUICC:-<none>}"
+
+
+          # Only inject stock eUICC if Lunaris does not already have it.
+          if [ -z "$EUICC" ] &&
+             [ "$INJECT_EUICC" = "true" ] &&
+             [ -d "$W/stock-compat" ]; then
+
+            echo "Injecting stock Pixel eUICC components..."
+
+            for part in system system_ext product; do
+
+              SRC_E="$W/stock-compat/$part"
+
+              [ -d "$SRC_E" ] || continue
+
+              DEST="$SYS"
+
+              case "$part" in
+                system_ext)
+                  DEST="$SYS/system_ext"
+                  ;;
+                product)
+                  DEST="$SYS/product"
+                  ;;
+              esac
+
+              sudo mkdir -p "$DEST"
+
+              # eUICC APKs
+              for d in \
+                "$SRC_E/priv-app"/* \
+                "$SRC_E/app"/*
+              do
+                [ -d "$d" ] || continue
+
+                case "$(basename "$d")" in
+                  *Euicc*|*eUICC*|*EuiccSupportPixel*)
+                    sudo mkdir -p "$DEST/$(basename "$(dirname "$d")")"
+                    sudo cp -a "$d" "$DEST/$(basename "$(dirname "$d")")/"
+                    ;;
+                esac
+              done
+
+              if [ -d "$SRC_E/etc/permissions" ]; then
+                sudo mkdir -p "$DEST/etc/permissions"
+
+                find "$SRC_E/etc/permissions" \
+                  -type f \
+                  -iname '*euicc*' \
+                  -exec sudo cp -a {} "$DEST/etc/permissions/" \; \
+                  2>/dev/null || true
+              fi
+
+              if [ -d "$SRC_E/etc/sysconfig" ]; then
+                sudo mkdir -p "$DEST/etc/sysconfig"
+
+                find "$SRC_E/etc/sysconfig" \
+                  -type f \
+                  -iname '*euicc*' \
+                  -exec sudo cp -a {} "$DEST/etc/sysconfig/" \; \
+                  2>/dev/null || true
+              fi
+
+            done
+
+          else
+            echo "Existing Lunaris eUICC stack retained."
+          fi
+
+
+          EUICC="$(find_euicc)"
+
+          if [ -z "$EUICC" ]; then
+
+            if [ "$REQUIRE_ESIM" = "true" ]; then
+              echo "::error::No eUICC stack found."
+              exit 1
+            fi
+
+            echo "::warning::No eUICC stack found."
+
+          else
+            echo "eSIM stack:"
+            echo "$EUICC"
+          fi
+
+
+          # ----------------------------------------------------------
+          # EUICC FEATURE DECLARATION
+          # ----------------------------------------------------------
+
+          sudo mkdir -p "$SYS/etc/permissions"
+
+          sudo tee \
+            "$SYS/etc/permissions/android.hardware.telephony.euicc.xml" \
+            >/dev/null <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <permissions>
+              <feature name="android.hardware.telephony.euicc"/>
+          </permissions>
+          XML
+
+          sudo chown 0:0 \
+            "$SYS/etc/permissions/android.hardware.telephony.euicc.xml"
+
+          sudo chmod 0644 \
+            "$SYS/etc/permissions/android.hardware.telephony.euicc.xml"
+
+          sudo setfattr \
+            -n security.selinux \
+            -v 'u:object_r:system_file:s0' \
+            "$SYS/etc/permissions/android.hardware.telephony.euicc.xml" \
+            2>/dev/null || true
+
+
+          # ==========================================================
+          # BASIC GSI PROPERTIES
+          # ==========================================================
+
+          echo "::group::GSI property sanity"
+
+          sudo grep \
+            -E \
+            '^(ro.build.version.release|ro.build.version.sdk|ro.product.cpu.abilist|ro.system.build.fingerprint)=' \
+            "$BP" ||
+            true
+
+          echo "::endgroup::"
+
+
+          # ==========================================================
+          # SELINUX LABELS
+          # ==========================================================
+
+          echo "::group::SELinux relabel"
+
+          if command -v setfiles >/dev/null 2>&1 &&
+             [ -f "$MNT/file_contexts" ]; then
+
+            sudo setfiles \
+              "$MNT/file_contexts" \
+              "$MNT" \
+              2>/dev/null || true
+
+          else
+
+            # At minimum label files that were newly added.
+            sudo find "$SYS/etc/permissions" \
+              -type f \
+              -exec setfattr \
+                -n security.selinux \
+                -v 'u:object_r:system_file:s0' \
+                {} \; \
+              2>/dev/null || true
+
+          fi
+
+          echo "::endgroup::"
+
+
+          # ==========================================================
+          # FINALIZE
+          # ==============================================================
+
+          sudo sync
+          sudo umount "$MNT"
+
+          e2fsck \
+            -fy \
+            "$WORK" || true
+
+          FINAL="$OUT/${OUTPUT_NAME}.img"
+
+
+          if [ "$FS_TYPE" = "erofs" ]; then
+
+            sudo mount \
+              -o loop,ro \
+              "$WORK" \
+              "$MNT"
+
+            sudo mkfs.erofs \
+              -zlz4hc \
+              -C16384 \
+              "$FINAL" \
+              "$MNT"
+
+            sudo umount "$MNT"
+
+            sudo chown "$USER:$USER" "$FINAL"
+
+            echo "erofs" > "$W/image-mode.txt"
+
+          else
+
+            sudo resize2fs \
+              -M \
+              "$WORK"
+
+            BLOCKS="$(
+              dumpe2fs -h "$WORK" 2>/dev/null |
+              awk '/^Block count:/{print $3}'
+            )"
+
+            BSIZE="$(
+              dumpe2fs -h "$WORK" 2>/dev/null |
+              awk '/^Block size:/{print $3}'
+            )"
+
+            truncate \
+              -s $((BLOCKS * BSIZE)) \
+              "$WORK"
+
+            mv "$WORK" "$FINAL"
+
+            echo "ext4" > "$W/image-mode.txt"
+          fi
+
+          echo "::group::Final image"
+
+          ls -lh "$FINAL"
+
+          file "$FINAL"
+
+          echo "::endgroup::"
+
+          xz \
+            -T0 \
+            -6 \
+            -v \
+            "$FINAL"
+
+          ls -lh "$OUT"
+
+
+      # ==============================================================
+      # BUILD STOCK PIXEL FIRMWARE BUNDLE
+      # ==============================================================
+
+      - name: "📱 Build Pixel 7 Firmware Bundle"
+        env:
+          FACTORY_URL: ${{ inputs.factory_image_url }}
+          INCLUDE_VENDOR: ${{ inputs.include_vendor_images }}
+          CUSTOM_BOOT_URL: ${{ inputs.custom_kernel_boot_url }}
+          OUTPUT_NAME: ${{ inputs.output_name }}
+          WIPE_USERDATA: ${{ inputs.wipe_userdata }}
+        run: |
+          set -euo pipefail
+
+          W="$GITHUB_WORKSPACE/workspace"
+          F="$W/factory"
+          B="$W/bundle"
+          OUT="$W/output"
+
+          mkdir -p "$B"
+
+          if [ ! -d "$F/img" ]; then
+            echo "::warning::No factory images available."
+            exit 0
+          fi
+
+
+          # ----------------------------------------------------------
+          # BOOT CHAIN
+          # ----------------------------------------------------------
+
+          for p in \
+            boot \
+            init_boot \
+            vendor_boot \
+            vendor_kernel_boot \
+            dtbo \
+            pvmfw \
+            vbmeta \
+            vbmeta_system \
+            vbmeta_vendor
+          do
+
+            if [ -f "$F/img/$p.img" ]; then
+              cp \
+                "$F/img/$p.img" \
+                "$B/$p.img"
+
+              echo "Bundled $p.img"
+            fi
+
+          done
+
+
+          # ----------------------------------------------------------
+          # OPTIONAL CUSTOM KERNEL
+          # ----------------------------------------------------------
+
+          if [ -n "$CUSTOM_BOOT_URL" ]; then
+
+            cp \
+              "$B/boot.img" \
+              "$B/boot_stock.img"
+
+            curl -fL \
+              --retry 8 \
+              --retry-delay 5 \
+              --retry-all-errors \
+              -o "$B/boot.img" \
+              "$CUSTOM_BOOT_URL"
+
+            echo "::warning::Custom boot.img supplied."
+          fi
+
+
+          # ----------------------------------------------------------
+          # VENDOR / SECURITY HALS
+          #
+          # These are particularly important for:
+          #   KeyMint
+          #   Gatekeeper
+          #   Weaver
+          #   fingerprint
+          #   secure clock
+          #   radio/eSIM
+          # ----------------------------------------------------------
+
+          if [ "$INCLUDE_VENDOR" = "true" ]; then
+
+            for p in \
+              vendor \
+              vendor_dlkm \
+              system_dlkm \
+              odm
+            do
+
+              if [ -f "$F/img/$p.img" ]; then
+
+                cp \
+                  "$F/img/$p.img" \
+                  "$B/$p.img"
+
+                echo "Bundled $p.img"
+              fi
+
+            done
+          fi
+
+
+          # ==========================================================
+          # VENDOR COMPATIBILITY REPORT
+          # ==========================================================
+
+          if [ -f "$B/vendor.img" ]; then
+
+            V="$B/vendor.img"
+
+            if [ "$(dd if="$V" bs=1 count=4 2>/dev/null | xxd -p)" = "ed26ff3a" ]; then
+
+              simg2img \
+                "$V" \
+                "$F/vendor.raw"
+
+              V="$F/vendor.raw"
+            fi
+
+            mkdir -p "$F/vendor-mnt"
+
+            if sudo mount \
+                -o loop,ro,noload \
+                "$V" \
+                "$F/vendor-mnt" 2>/dev/null; then
+
+              GSDK="$(cat "$W/gsi-sdk.txt" 2>/dev/null || echo unknown)"
+
+              VSDK="$(
+                sudo grep \
+                  -m1 \
+                  '^ro.vendor.build.version.sdk=' \
+                  "$F/vendor-mnt/build.prop" 2>/dev/null |
+                cut -d= -f2- ||
+                true
+              )"
+
+              echo "GSI SDK:    $GSDK"
+              echo "Vendor SDK: ${VSDK:-unknown}"
+
+              {
+                echo "Security HAL declarations:"
+                sudo grep \
+                  -rhoE \
+                  'android\.hardware\.(gatekeeper|security\.keymint|security\.authgraph|weaver|security\.secureclock|security\.sharedsecret)' \
+                  "$F/vendor-mnt/etc/vintf" \
+                  2>/dev/null |
+                  sort -u ||
+                  true
+              } | tee "$B/vendor-security-hals.txt"
+
+              if [ -n "$VSDK" ] &&
+                 [ "$GSDK" != "unknown" ] &&
+                 [ "$VSDK" != "$GSDK" ]; then
+
+                echo "::warning::GSI SDK ($GSDK) and vendor SDK ($VSDK) differ."
+                echo "::warning::Use matching Pixel firmware when testing credential/biometric functionality."
+              fi
+
+              sudo umount "$F/vendor-mnt"
+
+            fi
+          fi
+
+
+          # ==========================================================
+          # FLASH SCRIPT
+          # ==============================================================
+
+          cat > "$B/flash_all.sh" <<'SH'
+          #!/usr/bin/env bash
+
+          set -euo pipefail
+
+          GSI="$(realpath "${1:?Usage: ./flash_all.sh <system.img>}")"
+
+          cd "$(dirname "$0")"
+
+          echo "Checking device..."
+
+          PRODUCT="$(fastboot getvar product 2>&1 || true)"
+
+          echo "$PRODUCT" | grep -q 'panther' || {
+            echo "ERROR: This is not a Pixel 7 panther."
+            exit 1
+          }
+
+          echo "Pixel 7 panther detected."
+
+
+          # ----------------------------------------------------------
+          # BOOT CHAIN
+          # ----------------------------------------------------------
+
+          for p in \
+            boot \
+            init_boot \
+            vendor_boot \
+            vendor_kernel_boot \
+            dtbo \
+            pvmfw
+          do
+
+            if [ -f "$p.img" ]; then
+              fastboot flash --slot=all "$p" "$p.img"
+            fi
+
+          done
+
+
+          # ----------------------------------------------------------
+          # VERIFIED BOOT
+          # ----------------------------------------------------------
+
+          if [ -f vbmeta.img ]; then
+
+            fastboot flash \
+              --slot=all \
+              --disable-verity \
+              --disable-verification \
+              vbmeta \
+              vbmeta.img
+
+          fi
+
+          for p in \
+            vbmeta_system \
+            vbmeta_vendor
+          do
+
+            if [ -f "$p.img" ]; then
+              fastboot flash \
+                --slot=all \
+                "$p" \
+                "$p.img"
+            fi
+
+          done
+
+
+          # ----------------------------------------------------------
+          # ENTER FASTBOOTD
+          # ----------------------------------------------------------
+
+          fastboot reboot fastboot
+
+          sleep 8
+
+
+          # ----------------------------------------------------------
+          # VENDOR SIDE
+          # ----------------------------------------------------------
+
+          for p in \
+            vendor \
+            vendor_dlkm \
+            system_dlkm \
+            odm
+          do
+
+            if [ -f "$p.img" ]; then
+              fastboot flash "$p" "$p.img"
+            fi
+
+          done
+
+
+          # ----------------------------------------------------------
+          # SYSTEM
+          # ----------------------------------------------------------
+
+          fastboot flash system "$GSI"
+
+
+          # ----------------------------------------------------------
+          # WIPE OLD CREDENTIAL / FBE STATE
+          #
+          # This is important when changing between incompatible
+          # framework/vendor combinations.
+          # ----------------------------------------------------------
+
+          if [ "${WIPE_USERDATA:-true}" = "true" ]; then
+
+            echo "Wiping userdata..."
+
+            fastboot -w
+
+          else
+
+            echo "WARNING: userdata was NOT wiped."
+
+            echo "Existing credential/encryption state may prevent"
+            echo "PIN/pattern/fingerprint from working."
+
+          fi
+
+
+          fastboot reboot
+          SH
+
+          chmod +x "$B/flash_all.sh"
+
+
+          cat > "$B/README.txt" <<EOF
+          Lunaris Pixel 7 panther compatibility bundle
+
+          GSI:
+          ${OUTPUT_NAME}.img.xz
+
+          Extract the image:
+
+            xz -d ${OUTPUT_NAME}.img.xz
+
+          Then:
+
+            ./flash_all.sh /path/to/${OUTPUT_NAME}.img
+
+          Device:
+            Google Pixel 7 (panther)
+
+          The bundle contains Pixel stock boot/vendor/security
+          components so that Lunaris uses the device's native:
+
+            - KeyMint
+            - Gatekeeper
+            - Weaver
+            - fingerprint HAL
+            - secure clock
+            - radio/eSIM stack
+            - vendor kernel modules
+
+          The flash script wipes userdata when wipe_userdata=true.
+
+          Bootloader must be unlocked.
+          EOF
+
+
+          (
+            cd "$B"
+            zip -qr \
+              "$OUT/${OUTPUT_NAME}-pixel7-firmware.zip" \
+              .
+          )
+
+
+      # ==============================================================
+      # FINAL VALIDATION
+      # ==============================================================
+
+      - name: "🧪 Final GSI Validation"
+        run: |
+          set -euo pipefail
+
+          W="$GITHUB_WORKSPACE/workspace"
+          OUT="$W/output"
+
+          IMG="$OUT/${{ inputs.output_name }}.img.xz"
+
+          test -f "$IMG"
+
+          echo "::group::Compressed image"
+
+          ls -lh "$IMG"
+
+          xz -t "$IMG"
+
+          echo "XZ integrity: OK"
+
+          echo "::endgroup::"
+
+
+          echo "::group::Image metadata"
+
+          xz --robot --list "$IMG" || true
+
+          echo "::endgroup::"
+
+
+          echo "::group::Output files"
+
+          find "$OUT" \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f %s bytes\n' |
+            sort
+
+          echo "::endgroup::"
+
+
+      # ==============================================================
+      # CHECKSUMS + RELEASE NOTES
+      # ==============================================================
+
+      - name: "🔑 Checksums and Release Notes"
+        env:
+          ROM_URL: ${{ inputs.rom_url }}
+          OUTPUT_NAME: ${{ inputs.output_name }}
+          FS_TYPE: ${{ inputs.fs_type }}
+        run: |
+          set -euo pipefail
+
+          W="$GITHUB_WORKSPACE/workspace"
+          OUT="$W/output"
+
+          cd "$OUT"
+
+          sha256sum \
+            ./*.img.xz \
+            ./*.zip \
+            > SHA256SUMS.txt
+
+
+          RAW_BYTES="$(
+            xz --robot --list ./*.img.xz |
+            awk -F '\t' '$1 == "totals" {print $5}'
+          )"
+
+          RAW_SIZE="$(
+            numfmt \
+              --to=iec-i \
+              --suffix=B \
+              "$RAW_BYTES"
+          )"
+
+
+          RELEASE_TAG="v$(date +%Y.%m.%d-%H%M%S)-${GITHUB_RUN_ID}"
+
+          RELEASE_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
+
+          SRC_CLEAN="${ROM_URL%%\?*}"
+
+
+          cat > build-info.txt <<EOF
+          Lunaris Pixel 7 GSI build
+          =========================
+
+          Output:
+          $OUTPUT_NAME
+
+          Device:
+          Google Pixel 7 (panther)
+
+          Source:
+          $SRC_CLEAN
+
+          Filesystem:
+          $FS_TYPE
+
+          Raw image size:
+          $RAW_SIZE
+
+          Android SDK:
+          $(cat ../gsi-sdk.txt 2>/dev/null || echo unknown)
+
+          eSIM:
+          Stock eUICC compatibility was added only when the GSI
+          did not already contain an eUICC stack.
+
+          Lockscreen:
+          Stock Pixel framework/SystemUI was NOT replaced.
+
+          Targeted compatibility material:
+          - biometric permissions
+          - fingerprint permissions
+          - credential/security configuration
+          - selected Pixel sysconfig
+          - selected Pixel RRO overlays
+          - Pixel eUICC components when required
+
+          Vendor:
+          Stock Pixel vendor/vendor_dlkm/system_dlkm/ODM bundled.
+
+          Kernel:
+          Stock Pixel kernel unless custom boot.img was supplied.
+
+          Commit:
+          $GITHUB_SHA
+
+          Workflow:
+          $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          Built:
+          $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          Checksums:
+          $(cat SHA256SUMS.txt)
+          EOF
+
+
+          cat > release-notes.md <<EOF
+          ## ${OUTPUT_NAME}
+
+          Pixel 7 panther Lunaris GSI with targeted eSIM and
+          lockscreen/credential compatibility.
+
+          ### What was changed
+
+          The build does NOT replace Lunaris SystemUI or the Android
+          framework with Pixel stock versions.
+
+          Instead it selectively imports Pixel compatibility material:
+
+          - biometric permissions
+          - fingerprint configuration
+          - credential/security configuration
+          - selected Pixel sysconfig
+          - selected Pixel RRO overlays
+          - Google's Pixel eUICC components when required
+
+          The firmware bundle also contains stock Pixel:
+
+          - boot
+          - init_boot
+          - vendor_boot
+          - vendor_kernel_boot
+          - dtbo
+          - pvmfw
+          - vbmeta
+          - vendor
+          - vendor_dlkm
+          - system_dlkm
+          - odm
+
+          These provide the Pixel-specific security and hardware HALs.
+
+          ### Lock screen
+
+          PIN/pattern/password/fingerprint functionality depends on
+          cooperation between Android framework components and the
+          Pixel vendor security HALs.
+
+          Therefore this build keeps the Lunaris framework while using
+          matching Pixel vendor/security firmware.
+
+          A clean userdata wipe is recommended when changing ROMs.
+
+          ### eSIM
+
+          The build first checks whether Lunaris already contains the
+          eUICC stack.
+
+          Stock Pixel eUICC components are injected only when the stack
+          is missing.
+
+          ### Flashing
+
+          Bootloader must be unlocked.
+
+          Extract:
+
+          \`\`\`
+          xz -d ${OUTPUT_NAME}.img.xz
+          \`\`\`
+
+          Then extract the firmware bundle and run:
+
+          \`\`\`
+          ./flash_all.sh /path/to/${OUTPUT_NAME}.img
+          \`\`\`
+
+          The default flash script wipes userdata.
+
+          ### Important
+
+          Do not flash this bundle onto a different Pixel model.
+
+          Target:
+          Google Pixel 7 / panther
+
+          Raw image size:
+          $RAW_SIZE
+          EOF
+
+
+          cat > telegram-message.html <<EOF
+          <b>${OUTPUT_NAME}</b>
+          <a href="${RELEASE_URL}">Open GitHub Release</a>
+          Pixel 7 panther | ${FS_TYPE} | ${RAW_SIZE}
+          EOF
+
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+
+
+      # ==============================================================
+      # ARTIFACT
+      # ==============================================================
+
+      - name: "📤 Upload Build Artifact"
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ inputs.output_name }}
+          path: |
+            workspace/output/*.img.xz
+            workspace/output/*.zip
+            workspace/output/SHA256SUMS.txt
+            workspace/output/build-info.txt
+            workspace/output/release-notes.md
+          retention-days: 7
+
+
+      # ==============================================================
+      # GITHUB RELEASE
+      # ==============================================================
+
+      - name: "🏷️ Create GitHub Release"
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "${{ inputs.output_name }} (Pixel 7)"
+          body_path: workspace/output/release-notes.md
+          files: |
+            workspace/output/*.img.xz
+            workspace/output/*.zip
+            workspace/output/SHA256SUMS.txt
+            workspace/output/build-info.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+      # ==============================================================
+      # TELEGRAM
+      # ==============================================================
+
+      - name: "📨 Sync Release to Telegram"
+        if: success()
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] ||
+             [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "Telegram secrets not configured."
+            exit 0
+          fi
+
+          bash scripts/send_telegram_message.sh \
+            "$TELEGRAM_BOT_TOKEN" \
+            "$TELEGRAM_CHAT_ID" \
+            workspace/output/telegram-message.html
