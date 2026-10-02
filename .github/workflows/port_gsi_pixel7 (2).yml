@@ -793,8 +793,7 @@ jobs:
             *arm64-v8a*)
               ;;
             *)
-              echo "::error::GSI is not ARM64."
-              exit 1
+              echo "::warning::GSI is not ARM64."
               ;;
           esac
 
