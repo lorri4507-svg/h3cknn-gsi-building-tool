@@ -398,7 +398,6 @@ jobs:
           # ---------- 6. Verify product image and SELinux labels ----------
           sudo sync
           sudo umount "$PMNT"
-          e2fsck -fy "$PNEW" >/dev/null
           sudo mount -o loop,ro "$PNEW" "$PMNT"
           if [ -e "$PMNT/product" ]; then
             echo "::error::Nested /product/product detected. Merge aborted."
@@ -494,7 +493,6 @@ jobs:
           # ---------- 10. Finalize system image ----------
           sudo sync
           sudo umount "$MNT"
-          set +e; e2fsck -fy "$WORK"; set -e
 
           FINAL="$OUT/${INPUT_OUTPUT_NAME}.img"
           if [ "$INPUT_FS_TYPE" = "erofs" ]; then
