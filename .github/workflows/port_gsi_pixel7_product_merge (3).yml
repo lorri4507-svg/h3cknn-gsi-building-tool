@@ -1,0 +1,821 @@
+name: "🔧 Lunaris GSI → Pixel 7 (eSIM)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: "📥 Direct URL to the GSI (.img.xz / .img)"
+        required: true
+        type: string
+        default: "https://github.com/Doze-off/Lunaris-AOSP_gsi/releases/download/2026-09-20/Lunaris-3.12-GSI_treble_arm64-ab-GAPPS-Official-20260920.img.xz"
+      output_name:
+        description: "📛 Output GSI name"
+        required: true
+        default: "Lunaris_Pixel7_eSIM_GSI"
+        type: string
+      fs_type:
+        description: "💾 Output filesystem"
+        required: true
+        default: "ext4"
+        type: choice
+        options:
+          - "ext4"
+          - "erofs"
+      require_esim_stack:
+        description: "📶 Fail the build if no eUICC (eSIM) app is found in the image"
+        required: true
+        default: true
+        type: boolean
+      factory_image_url:
+        description: "📱 Pixel 7 (panther) factory image ZIP (stock kernel, vendor, vbmeta). Default: Android 16 QPR2 (BP4A.251205.006). Clear the field to skip."
+        required: false
+        default: "https://dl.google.com/dl/android/aosp/panther-bp4a.251205.006-factory-4455f800.zip"
+        type: string
+      inject_stock_euicc:
+        description: "📶 If the GSI has no eUICC (eSIM) app, pull EuiccGoogle/EuiccSupportPixel from the Pixel 7 factory image and add them"
+        required: true
+        default: true
+        type: boolean
+      include_vendor_images:
+        description: "🧩 Also bundle stock vendor/odm/dlkm images (recommended: fixes lock screen / KeyMint mismatches)"
+        required: true
+        default: true
+        type: boolean
+      custom_kernel_boot_url:
+        description: "🧬 Optional: URL to a custom-kernel boot.img for panther (replaces the stock boot.img in the bundle)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  port_gsi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    concurrency:
+      group: port-gsi-pixel7
+      cancel-in-progress: false
+    permissions:
+      contents: write
+
+    steps:
+      - name: "📦 Checkout Repository"
+        uses: actions/checkout@v5
+
+      - name: "🧹 Free Runner Disk Space"
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: "⚙️ Install Dependencies"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xz-utils android-sdk-libsparse-utils e2fsprogs \
+            erofs-utils rsync attr xxd file unzip zip
+
+
+      - name: "📥 Fetch Pixel 7 Stock Firmware & Extract eUICC Apps"
+        env:
+          FACTORY_URL: ${{ inputs.factory_image_url }}
+          INJECT_EUICC: ${{ inputs.inject_stock_euicc }}
+        run: |
+          set -euo pipefail
+          W="$GITHUB_WORKSPACE/workspace"
+          F="$W/factory"; E="$W/euicc"
+          mkdir -p "$F" "$E"
+          cd "$F"
+          hex_at() { dd if="$1" bs=1 skip="$2" count="$3" 2>/dev/null | xxd -p; }
+
+          if [ -z "$FACTORY_URL" ]; then
+            echo "::error::A Pixel 7 factory image is required for the stock-product merge."
+            exit 1
+          fi
+
+          curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o factory.zip "$FACTORY_URL"
+
+          EXPECTED=$(basename "${FACTORY_URL%%\?*}" | sed -nE 's/.*-factory-([0-9a-f]{8})\.zip$/\1/p')
+          if [ -n "$EXPECTED" ]; then
+            ACTUAL=$(sha256sum factory.zip | cut -c1-8)
+            if [ "$ACTUAL" != "$EXPECTED" ]; then
+              echo "::error::Factory image checksum mismatch (expected $EXPECTED..., got $ACTUAL...)."
+              exit 1
+            fi
+            echo "Factory image checksum OK ($ACTUAL)"
+          fi
+
+          unzip -q factory.zip -d fx
+          rm -f factory.zip
+          IMGZIP=$(find fx -name 'image-panther-*.zip' | head -n1)
+          if [ -z "$IMGZIP" ]; then
+            echo "::error::No image-panther-*.zip found. This workflow requires Pixel 7 (panther) firmware."
+            exit 1
+          fi
+          unzip -q "$IMGZIP" -d img
+          rm -rf fx
+
+          # Keep stock product.img: it is the base for product-new.img.
+          [ -f img/product.img ] || { echo "::error::Stock product.img is missing."; exit 1; }
+
+          # Extract only eUICC pieces when requested. The complete stock product image
+          # remains untouched so it can be used later for the product merge.
+          if [ "$INJECT_EUICC" = "true" ]; then
+            for part in system_ext product system; do
+              f="img/$part.img"
+              [ -f "$f" ] || continue
+              R="$f"
+              if [ "$(hex_at "$f" 0 4)" = "ed26ff3a" ]; then
+                R="$F/$part.raw"; simg2img "$f" "$R"
+              fi
+              M="$F/mnt_$part"; mkdir -p "$M"
+              if ! sudo mount -o loop,ro "$R" "$M"; then
+                echo "::warning::Could not mount stock $part.img; skipping eUICC extraction from it"
+                continue
+              fi
+              BASE="$M"
+              [ "$part" = "system" ] && [ -f "$M/system/build.prop" ] && BASE="$M/system"
+
+              for d in "$BASE"/priv-app/*[Ee]uicc* "$BASE"/app/*[Ee]uicc*; do
+                [ -d "$d" ] || continue
+                kind=$(basename "$(dirname "$d")")
+                mkdir -p "$E/$part/$kind"
+                sudo cp -a "$d" "$E/$part/$kind/"
+                echo "extracted $part/$kind/$(basename "$d")"
+              done
+
+              for sub in permissions sysconfig; do
+                if [ -d "$BASE/etc/$sub" ]; then
+                  mkdir -p "$E/$part/etc/$sub"
+                  find "$BASE/etc/$sub" -maxdepth 1 -type f -iname '*euicc*' \
+                    -exec sudo cp -a {} "$E/$part/etc/$sub/" \;
+                fi
+              done
+
+              if [ -d "$BASE/etc/permissions" ]; then
+                python3 - "$BASE/etc/permissions" "$E/$part/etc/permissions/privapp-permissions-stock-euicc.xml" <<'PY'
+          import sys, glob, os
+          import xml.etree.ElementTree as ET
+          src, dst = sys.argv[1:3]
+          out = ET.Element("permissions"); n = 0
+          for f in sorted(glob.glob(os.path.join(src, "privapp-permissions*.xml"))):
+              try:
+                  root = ET.parse(f).getroot()
+              except Exception:
+                  continue
+              for el in root.iter("privapp-permissions"):
+                  if "euicc" in el.get("package", "").lower():
+                      out.append(el); n += 1
+          if n:
+              os.makedirs(os.path.dirname(dst), exist_ok=True)
+              ET.ElementTree(out).write(dst, encoding="utf-8", xml_declaration=True)
+              print("privapp-permissions entries extracted:", n)
+          PY
+              fi
+              sudo umount "$M"
+              rm -f "$F/$part.raw"
+            done
+
+            sudo chown -R "$USER" "$E"
+            find "$E" -type d -name oat -prune -exec rm -rf {} + 2>/dev/null || true
+          fi
+
+          # system/system_ext are only needed for eUICC extraction now. Keep product.img.
+          rm -f img/system.img img/system_ext.img
+          df -h /
+
+
+      - name: "🚀 Download GSI, Merge Product & Patch System"
+        env:
+          INPUT_ROM_URL: ${{ inputs.rom_url }}
+          INPUT_OUTPUT_NAME: ${{ inputs.output_name }}
+          INPUT_FS_TYPE: ${{ inputs.fs_type }}
+          INPUT_REQUIRE_ESIM: ${{ inputs.require_esim_stack }}
+          INPUT_INJECT_EUICC: ${{ inputs.inject_stock_euicc }}
+        run: |
+          set -euo pipefail
+          W="$GITHUB_WORKSPACE/workspace"
+          T="$W/tmp"; MNT="$W/mnt"; SRC="$W/src"; OUT="$W/output"
+          PMNT="$T/product-new-mnt"; STOCKMNT="$T/stock-product-ro"; GMNT="$T/gsi-product"; PNEW="$T/product-new.img"
+          mkdir -p "$T" "$MNT" "$SRC" "$OUT" "$PMNT" "$STOCKMNT" "$GMNT"
+          cd "$T"
+
+          hex_at() { dd if="$1" bs=1 skip="$2" count="$3" 2>/dev/null | xxd -p; }
+
+          # ---------- 1. Download and unpack GSI ----------
+          curl -fL --retry 5 --retry-delay 5 --retry-all-errors \
+            -o rom.download "$INPUT_ROM_URL"
+          if xz -t rom.download 2>/dev/null; then
+            xz -dc rom.download > rom.img
+          else
+            mv rom.download rom.img
+          fi
+          rm -f rom.download
+
+          if [ "$(hex_at rom.img 0 4)" = "ed26ff3a" ]; then
+            simg2img rom.img raw.img
+            mv raw.img rom.img
+          fi
+
+          if [ "$(hex_at rom.img 1080 2)" = "53ef" ]; then
+            SRC_FS=ext4
+          elif [ "$(hex_at rom.img 1024 4)" = "e2e1f5e0" ]; then
+            SRC_FS=erofs
+          else
+            echo "::error::Unrecognized GSI filesystem"; exit 1
+          fi
+          echo "Source filesystem: $SRC_FS"
+
+          # ---------- 2. Mount GSI read-only ----------
+          if [ "$SRC_FS" = "ext4" ]; then
+            sudo mount -t ext4 -o loop,ro,noload "$T/rom.img" "$SRC"
+          else
+            sudo mount -t erofs -o loop,ro "$T/rom.img" "$SRC"
+          fi
+
+          # ---------- 3. Locate GSI system root and GSI product ----------
+          if [ -f "$SRC/system/build.prop" ]; then
+            GSISYS="$SRC/system"
+          elif [ -f "$SRC/build.prop" ]; then
+            GSISYS="$SRC"
+          else
+            echo "::error::GSI build.prop not found"; sudo find "$SRC" -maxdepth 2 -type f -name build.prop -print; exit 1
+          fi
+
+          if [ -d "$SRC/system/product" ]; then
+            GSIPRODUCT="$SRC/system/product"
+          elif [ -d "$SRC/product" ]; then
+            GSIPRODUCT="$SRC/product"
+          else
+            echo "::error::GSI does not contain /system/product or /product"
+            exit 1
+          fi
+
+          BP="$GSISYS/build.prop"
+          getp() { sudo grep -m1 "^$1=" "$BP" | cut -d= -f2- || true; }
+          GSDK="$(getp ro.build.version.sdk)"
+          echo "Android : $(getp ro.build.version.release) (SDK $GSDK)"
+          echo "ABI list: $(getp ro.system.product.cpu.abilist)"
+          echo "Fprint  : $(getp ro.system.build.fingerprint)"
+          printf '%s\n' "$GSDK" > "$W/gsi-sdk.txt"
+
+          ABI="$(getp ro.system.product.cpu.abilist)$(getp ro.product.cpu.abilist)"
+          case "$ABI" in
+            *arm64-v8a*) ;;
+            *) echo "::error::Image is not arm64; Pixel 7 needs arm64"; exit 1 ;;
+          esac
+
+          # ---------- 4. Build product-new.img from STOCK product.img ----------
+          # Never copy the parent directory itself. The final image root is /product,
+          # so a source file "$GSIPRODUCT/foo" becomes "/product/foo" only after
+          # the image is mounted; there is never a /product/product nesting.
+          STOCK_PRODUCT="$W/factory/img/product.img"
+          STOCK_RAW="$T/stock-product.raw"
+          if [ "$(hex_at "$STOCK_PRODUCT" 0 4)" = "ed26ff3a" ]; then
+            simg2img "$STOCK_PRODUCT" "$STOCK_RAW"
+          else
+            cp "$STOCK_PRODUCT" "$STOCK_RAW"
+          fi
+
+          STOCK_FS_EXT4=0
+          if [ "$(hex_at "$STOCK_RAW" 1080 2)" = "53ef" ]; then STOCK_FS_EXT4=1; fi
+          if [ "$STOCK_FS_EXT4" != 1 ]; then
+            echo "::error::Stock Pixel 7 product.img is not ext4. Refusing to rebuild it as ext4 because that can change filesystem semantics."
+            exit 1
+          fi
+
+          PRODUCT_BYTES=$(stat -c '%s' "$STOCK_RAW")
+          echo "Stock product partition size: $(numfmt --to=iec-i --suffix=B "$PRODUCT_BYTES")"
+
+          # Build the replacement product image at 4.8 GiB (binary GiB), rather
+          # than the stock ~3.8 GiB size. Round down to a 4 KiB boundary for
+          # ext4/block-device alignment. This is the filesystem image size; the
+          # Pixel dynamic-partition metadata must also provide a product_a
+          # partition of at least this size before flashing it.
+          PRODUCT_NEW_BYTES=$(( (48 * 1024 * 1024 * 1024 / 10) / 4096 * 4096 ))
+          echo "New product image size: $(numfmt --to=iec-i --suffix=B "$PRODUCT_NEW_BYTES")"
+
+          # Rebuild product at the larger 4.8 GiB size, but don't copy
+          # giant optional stock speech/voice payloads that consume nearly all
+          # available blocks. These are not required to boot Android or run the
+          # Pixel framework, and excluding them gives the GSI product merge room.
+          # The filesystem is 4.8 GiB logically; later we punch holes in unused
+          # blocks so the generated artifact uses less runner disk.
+          truncate -s "$PRODUCT_NEW_BYTES" "$PNEW"
+          mkfs.ext4 -q -b 4096 -L product -O ^has_journal "$PNEW"
+          sudo mount -o loop,rw "$PNEW" "$PMNT"
+          sudo mount -o loop,ro,noload "$STOCK_RAW" "$STOCKMNT"
+
+          # SODA_SPEAKER_TURN.scd.encoder and related speech-recognition assets are
+          # large optional product payloads. Keep the stock product tree otherwise
+          # intact, while deliberately omitting only these bulky non-boot assets.
+          PRODUCT_EXCLUDES=(
+            --exclude='usr/srec/***'
+            --exclude='usr/share/tts/***'
+            --exclude='usr/share/speech/***'
+            --exclude='usr/share/voice/***'
+          )
+          echo "Stock product copy excludes: optional speech/voice payloads"
+          sudo rsync -aHAX --numeric-ids "${PRODUCT_EXCLUDES[@]}" "$STOCKMNT"/ "$PMNT"/
+
+          echo "Product free space after stock copy:"
+          df -h "$PMNT"
+          sudo du -sh "$STOCKMNT/usr/srec" "$STOCKMNT/usr/share/tts" 2>/dev/null || true
+          sudo umount "$STOCKMNT"
+          rm -f "$STOCK_RAW"
+
+          # There must be enough free space for the selected GSI product payload.
+          # Fail early with useful numbers instead of letting rsync die halfway.
+          FREE_KB=$(df -Pk "$PMNT" | awk 'NR==2 {print $4}')
+          echo "Free product space before GSI merge: ${FREE_KB} KiB"
+          if [ "$FREE_KB" -lt 131072 ]; then
+            echo "::warning::Less than 128 MiB remains in product-new.img before the GSI merge."
+          fi
+
+          # ---------- 5. Selective GSI product merge ----------
+          # Low-risk, configuration-oriented paths are merged first. Existing stock
+          # files are NOT overwritten. Framework jars and preinstalled apps are not
+          # bulk-replaced because those are tightly coupled to the Pixel vendor.
+          mkdir -p "$T/gsi-product-safe"
+
+          for d in \
+            overlay \
+            etc/permissions \
+            etc/sysconfig \
+            etc/preferred-apps \
+            etc/automotive \
+            etc/selinux
+          do
+            if [ -d "$GSIPRODUCT/$d" ]; then
+              mkdir -p "$T/gsi-product-safe/$(dirname "$d")"
+              sudo rsync -aHAX --ignore-existing "$GSIPRODUCT/$d/" "$T/gsi-product-safe/$d/"
+              echo "Candidate GSI product merge: $d"
+            fi
+          done
+
+          # Add missing product apps only when their directory does not already exist
+          # in stock. This avoids replacing Pixel-specific implementations.
+          for root in app priv-app; do
+            if [ -d "$GSIPRODUCT/$root" ]; then
+              mkdir -p "$T/gsi-product-safe/$root"
+              for d in "$GSIPRODUCT/$root"/*; do
+                [ -d "$d" ] || continue
+                n="$(basename "$d")"
+                if [ ! -e "$PMNT/$root/$n" ]; then
+                  sudo cp -a "$d" "$T/gsi-product-safe/$root/"
+                  echo "Added missing GSI product app: $root/$n"
+                else
+                  echo "Kept stock product app: $root/$n"
+                fi
+              done
+            fi
+          done
+
+          # Merge safe content into product root. No /product/product nesting.
+          sudo rsync -aHAX --numeric-ids "$T/gsi-product-safe"/ "$PMNT"/
+
+          # Keep only GSI product files that are actually useful and non-duplicative.
+          # Explicitly refuse dangerous cross-partition framework replacement.
+          rm -rf "$T/gsi-product-safe/framework" "$T/gsi-product-safe/lib" \
+                 "$T/gsi-product-safe/lib64" "$T/gsi-product-safe/bin" \
+                 "$T/gsi-product-safe/xbin" "$T/gsi-product-safe/etc/init"
+
+          # Record exactly what the merge did.
+          {
+            echo "Pixel 7 product merge"
+            echo "====================="
+            echo "Base: stock Google panther product.img"
+            echo "Overlay source: GSI $INPUT_ROM_URL"
+            echo "GSI product path: $GSIPRODUCT"
+            echo "Policy: preserve stock files; add only missing GSI files in selected safe paths"
+            echo
+            echo "Stock product top-level:"
+            sudo find "$PMNT" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
+            echo
+            echo "Merged/available GSI product content:"
+            sudo find "$GSIPRODUCT" -mindepth 1 -maxdepth 2 -printf '%P\n' | sort | head -n 1000
+          } | tee "$OUT/product-merge-report.txt"
+
+          # ---------- 6. Verify product image and SELinux labels ----------
+          sudo sync
+          sudo umount "$PMNT"
+          e2fsck -fy "$PNEW" >/dev/null
+          sudo mount -o loop,ro "$PNEW" "$PMNT"
+          if [ -e "$PMNT/product" ]; then
+            echo "::error::Nested /product/product detected. Merge aborted."
+            exit 1
+          fi
+          sudo find "$PMNT" -maxdepth 2 -type f | head -n 50
+          sudo umount "$PMNT"
+
+          # ---------- 7. Build writable system image WITHOUT GSI /system/product ----------
+          USED=$(sudo du -sb "$SRC" --exclude='system/product' --exclude='product' | cut -f1)
+          WORK="$T/work.img"
+          truncate -s $(( USED + USED/8 + 700*1024*1024 )) "$WORK"
+          mkfs.ext4 -q -b 4096 -L system -O ^has_journal "$WORK"
+          sudo mount -o loop,rw "$WORK" "$MNT"
+
+          # Copy everything except the GSI product tree. The product image now exists
+          # separately as product-new.img.
+          sudo rsync -aHAX --numeric-ids \
+            --exclude='/system/product/***' \
+            --exclude='/product/***' \
+            "$SRC"/ "$MNT"/
+          sudo umount "$SRC"
+          rm -f "$T/rom.img"
+
+          if [ ! -f "$MNT/system/build.prop" ] && [ ! -f "$MNT/build.prop" ]; then
+            echo "::error::Rebuilt system image lost build.prop"; exit 1
+          fi
+
+          if [ -f "$MNT/system/build.prop" ]; then SYS="$MNT/system"; else SYS="$MNT"; fi
+          BP="$SYS/build.prop"
+
+          # ---------- 8. eSIM: preserve the existing known-working stack ----------
+          find_euicc() {
+            sudo find "$MNT" -maxdepth 7 \( -iname 'EuiccGoogle*' -o -iname 'EuiccSupportPixel*' \) \
+              -not -path '*/lib/*' -not -path '*/lib64/*' | head -n 20 || true
+          }
+
+          EUICC_FOUND=$(find_euicc)
+          echo "eSIM stack before optional injection: ${EUICC_FOUND:-<none>}"
+
+          if [ -z "$EUICC_FOUND" ] && [ "$INPUT_INJECT_EUICC" = "true" ] \
+             && [ -n "$(ls -A "$W/euicc" 2>/dev/null)" ]; then
+            for part_dir in "$W"/euicc/*/; do
+              part=$(basename "$part_dir")
+              if [ "$part" = "system" ]; then DEST="$SYS"; else DEST="$SYS/$part"; fi
+              sudo mkdir -p "$DEST"
+              sudo rsync -rlt --chown=0:0 --chmod=D755,F644 "$part_dir" "$DEST/"
+              while IFS= read -r rel; do
+                sudo setfattr -n security.selinux -v "u:object_r:system_file:s0" "$DEST/$rel" 2>/dev/null || true
+              done < <(cd "$part_dir" && find . -mindepth 1)
+            done
+            EUICC_FOUND=$(find_euicc)
+          fi
+
+          if [ -z "$EUICC_FOUND" ] && [ "$INPUT_REQUIRE_ESIM" = "true" ]; then
+            echo "::error::No eUICC app found after merge."
+            exit 1
+          fi
+
+          # ---------- 9. Conservative system compatibility patches ----------
+          # Do NOT inject arbitrary ro.* performance/debug properties. They can create
+          # device-specific regressions. These patches only remove the GSI product
+          # payload that is now handled by stock product-new.img and ensure the eUICC
+          # feature declaration exists.
+          PERM_DIR="$SYS/etc/permissions"
+          sudo mkdir -p "$PERM_DIR"
+          if [ ! -f "$PERM_DIR/android.hardware.telephony.euicc.xml" ]; then
+            sudo tee "$PERM_DIR/android.hardware.telephony.euicc.xml" >/dev/null <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <permissions>
+              <feature name="android.hardware.telephony.euicc" />
+          </permissions>
+          XML
+            sudo chown 0:0 "$PERM_DIR/android.hardware.telephony.euicc.xml"
+            sudo chmod 644 "$PERM_DIR/android.hardware.telephony.euicc.xml"
+            sudo setfattr -n security.selinux -v "u:object_r:system_file:s0" \
+              "$PERM_DIR/android.hardware.telephony.euicc.xml" 2>/dev/null || true
+          fi
+
+          # Settings/Display diagnostics: record overlays and packages that commonly
+          # participate in Settings resource resolution. We don't replace framework
+          # jars or Pixel vendor components automatically.
+          {
+            echo "GSI SDK: $GSDK"
+            echo "System fingerprint: $(grep -m1 '^ro.system.build.fingerprint=' "$BP" || true)"
+            echo
+            echo "System overlays:"
+            sudo find "$SYS/overlay" -maxdepth 2 -type f 2>/dev/null | sort || true
+            echo
+            echo "Product overlay candidates were moved to product-new.img."
+          } > "$OUT/system-compat-report.txt"
+
+          # ---------- 10. Finalize system image ----------
+          sudo sync
+          sudo umount "$MNT"
+          set +e; e2fsck -fy "$WORK"; set -e
+
+          FINAL="$OUT/${INPUT_OUTPUT_NAME}.img"
+          if [ "$INPUT_FS_TYPE" = "erofs" ]; then
+            sudo mount -o loop,ro "$WORK" "$MNT"
+            sudo mkfs.erofs -zlz4hc -C16384 "$FINAL" "$MNT"
+            sudo umount "$MNT"
+            sudo chown "$USER" "$FINAL"
+            echo "erofs" > "$W/image-mode.txt"
+          else
+            resize2fs -M "$WORK"
+            BLOCKS=$(dumpe2fs -h "$WORK" 2>/dev/null | awk '/^Block count:/{print $3}')
+            BSIZE=$(dumpe2fs -h "$WORK" 2>/dev/null | awk '/^Block size:/{print $3}')
+            truncate -s $(( BLOCKS * BSIZE )) "$WORK"
+            mv "$WORK" "$FINAL"
+            echo "ext4" > "$W/image-mode.txt"
+          fi
+          rm -f "$WORK"
+
+          # Compress both images for the release.
+          echo "System image: $(ls -lh "$FINAL" | awk '{print $5}')"
+          xz -T0 -6 -v "$FINAL"
+
+          # product-new.img is logically 4.8 GiB. Unused zero blocks do not need
+          # to consume runner disk because fallocate -d punches holes in them.
+          # fallocate -d punches holes in zero-filled free ext4 blocks without
+          # changing the filesystem's logical size.
+          if command -v fallocate >/dev/null 2>&1; then
+            fallocate -d "$PNEW" || true
+          fi
+          echo "Sparse product image: $(du -h "$PNEW" | cut -f1) disk usage / $(ls -lh "$PNEW" | awk '{print $5}') logical size"
+          xz -T0 -6 -v "$PNEW"
+          cp "$PNEW.xz" "$OUT/${INPUT_OUTPUT_NAME}-product-new.img.xz"
+          rm -f "$PNEW.xz"
+
+          ls -lh "$OUT"
+
+
+      - name: "📱 Build Pixel 7 Firmware Bundle (kernel, vendor, product, vbmeta)"
+        env:
+          FACTORY_URL: ${{ inputs.factory_image_url }}
+          INCLUDE_VENDOR: ${{ inputs.include_vendor_images }}
+          CUSTOM_BOOT_URL: ${{ inputs.custom_kernel_boot_url }}
+          INPUT_OUTPUT_NAME: ${{ inputs.output_name }}
+        run: |
+          set -euo pipefail
+          W="$GITHUB_WORKSPACE/workspace"
+          B="$W/bundle"; F="$W/factory"; OUT="$W/output"
+          mkdir -p "$B" "$F"
+          cd "$F"
+          hex_at() { dd if="$1" bs=1 skip="$2" count="$3" 2>/dev/null | xxd -p; }
+
+          [ -d "$F/img" ] || { echo "::error::No stock firmware was fetched."; exit 1; }
+
+          for p in boot init_boot vendor_boot vendor_kernel_boot dtbo pvmfw vbmeta vbmeta_system vbmeta_vendor; do
+            [ -f "img/$p.img" ] && cp "img/$p.img" "$B/$p.img" && echo "bundled $p.img"
+          done
+
+          if [ -n "$CUSTOM_BOOT_URL" ]; then
+            cp "$B/boot.img" "$B/boot_stock.img"
+            curl -fL --retry 5 --retry-delay 5 -o "$B/boot.img" "$CUSTOM_BOOT_URL"
+            echo "::warning::Custom kernel boot.img used; modules must match vendor_dlkm/system_dlkm."
+          fi
+
+          if [ "$INCLUDE_VENDOR" = "true" ]; then
+            for p in vendor vendor_dlkm system_dlkm odm; do
+              [ -f "img/$p.img" ] && cp "img/$p.img" "$B/$p.img" && echo "bundled $p.img"
+            done
+
+            if [ -f "$B/vendor.img" ]; then
+              V="$B/vendor.img"
+              if [ "$(hex_at "$V" 0 4)" = "ed26ff3a" ]; then
+                simg2img "$V" "$F/vendor_raw.img"; V="$F/vendor_raw.img"
+              fi
+              mkdir -p "$F/vmnt"
+              if sudo mount -o loop,ro "$V" "$F/vmnt" 2>/dev/null; then
+                VSDK=$(sudo grep -m1 '^ro.vendor.build.version.sdk=' "$F/vmnt/build.prop" | cut -d= -f2- || true)
+                GSDK=$(cat "$W/gsi-sdk.txt" 2>/dev/null || echo unknown)
+                {
+                  echo "GSI SDK:    $GSDK"
+                  echo "Vendor SDK: ${VSDK:-unknown}"
+                  echo "Security HALs:"
+                  sudo grep -rhoE 'android\.hardware\.(gatekeeper|security\.keymint|security\.authgraph|weaver|security\.secureclock|security\.sharedsecret)' \
+                    "$F/vmnt/etc/vintf" 2>/dev/null | sort -u || true
+                } | tee "$B/vendor-compat.txt"
+                if [ -n "${VSDK:-}" ] && [ "$GSDK" != "unknown" ] && [ "$VSDK" != "$GSDK" ]; then
+                  echo "::warning::GSI SDK ($GSDK) differs from vendor SDK ($VSDK); lock-screen/security HAL compatibility may be affected."
+                fi
+                sudo umount "$F/vmnt"
+              fi
+            fi
+          fi
+
+          # Keep product-new compressed inside the firmware ZIP instead of
+          # expanding another 3.8 GiB raw copy on the runner. The flash script
+          # decompresses it only when it is actually flashed.
+          PRODUCT_XZ="$OUT/${INPUT_OUTPUT_NAME}-product-new.img.xz"
+          if [ -f "$PRODUCT_XZ" ]; then
+            cp "$PRODUCT_XZ" "$B/product-new.img.xz"
+          else
+            echo "::error::product-new image was not generated."
+            exit 1
+          fi
+
+          cat > "$B/flash_all.sh" <<'SH'
+          #!/usr/bin/env bash
+          # Pixel 7 (panther) Lunaris GSI + stock-product merge.
+          # Bootloader must be unlocked. This script wipes userdata.
+          set -euo pipefail
+
+          GSI="$(realpath "${1:?usage: ./flash_all.sh <system.img>}")"
+          PRODUCT_XZ="$(realpath "${2:-product-new.img.xz}")"
+          PRODUCT_TMP="$(mktemp --suffix=.product.img)"
+          trap 'rm -f "$PRODUCT_TMP"' EXIT
+          xz -dc "$PRODUCT_XZ" > "$PRODUCT_TMP"
+          PRODUCT="$PRODUCT_TMP"
+          cd "$(dirname "$0")"
+
+          fastboot getvar product 2>&1 | grep -q panther || {
+            echo "Not a Pixel 7 (panther)"; exit 1;
+          }
+
+          for p in boot init_boot vendor_boot vendor_kernel_boot dtbo pvmfw; do
+            [ -f "$p.img" ] && fastboot flash --slot=all "$p" "$p.img"
+          done
+
+          [ -f vbmeta.img ] && \
+            fastboot flash --slot=all --disable-verity --disable-verification vbmeta vbmeta.img
+
+          for p in vbmeta_system vbmeta_vendor; do
+            [ -f "$p.img" ] && fastboot flash --slot=all "$p" "$p.img"
+          done
+
+          fastboot reboot fastboot
+          sleep 8
+
+          for p in vendor vendor_dlkm system_dlkm odm; do
+            [ -f "$p.img" ] && fastboot flash "$p" "$p.img"
+          done
+
+          # product-new is the stock product filesystem with selected GSI product
+          # additions. If product was previously deleted, recreate it first.
+          if ! fastboot getvar partition-size:product 2>&1 | grep -q '0x'; then
+            echo "product partition is not present. If you intentionally deleted product_a,"
+            echo "you cannot flash product-new.img until that logical partition is recreated."
+            exit 1
+          fi
+          fastboot flash product "$PRODUCT"
+          fastboot flash system "$GSI"
+
+          fastboot -w
+          fastboot reboot
+          SH
+          chmod +x "$B/flash_all.sh"
+
+          cat > "$B/README.txt" <<EOF
+          Pixel 7 (panther) Lunaris GSI + stock product merge for ${INPUT_OUTPUT_NAME}
+
+          Extract ${INPUT_OUTPUT_NAME}.img.xz to system.img.
+          The bundle includes product-new.img, built from the stock Pixel 7 product
+          filesystem with conservative GSI product additions.
+
+          Run:
+            ./flash_all.sh /path/to/system.img
+          or:
+            ./flash_all.sh /path/to/system.img /path/to/product-new.img
+
+          This wipes data. Requires an unlocked bootloader and matching Pixel 7
+          firmware/vendor components.
+
+          IMPORTANT:
+          - product-new.img is 4.8 GiB and requires product_a to be resized/recreated to at least 4.8 GiB before flashing.
+          - Do NOT delete product_a before flashing this bundle.
+          - The workflow intentionally does not bulk-replace framework jars, lib/lib64,
+            init files, or existing Pixel product apps because those are tightly
+            coupled to the stock vendor/framework stack.
+          EOF
+
+          cp "$OUT/product-merge-report.txt" "$B/product-merge-report.txt"
+          cp "$OUT/system-compat-report.txt" "$B/system-compat-report.txt"
+
+          (cd "$B" && zip -qr "$OUT/${INPUT_OUTPUT_NAME}-pixel7-firmware.zip" .)
+          ls -lh "$OUT"
+
+          ls -lh "$OUT"
+          rm -rf "$F"
+
+      - name: "🔑 Checksums & Release Notes"
+        env:
+          INPUT_ROM_URL: ${{ inputs.rom_url }}
+          INPUT_OUTPUT_NAME: ${{ inputs.output_name }}
+          INPUT_FS_TYPE: ${{ inputs.fs_type }}
+        run: |
+          set -euo pipefail
+          cd workspace/output
+          shopt -s nullglob
+          sha256sum ./*.img.xz ./*.zip *.txt > SHA256SUMS.txt
+          HAS_BUNDLE=no
+          if ls ./*-pixel7-firmware.zip >/dev/null 2>&1; then HAS_BUNDLE=yes; fi
+
+          IMAGE_MODE=$(cat ../image-mode.txt 2>/dev/null || echo unknown)
+          RAW_BYTES=$(xz --robot --list ./*.img.xz | awk -F '\t' '$1 == "totals" { print $5 }')
+          RAW_SIZE=$(numfmt --to=iec-i --suffix=B "$RAW_BYTES")
+          RELEASE_TAG="v$(date +%Y.%m.%d-%H%M%S)-${GITHUB_RUN_ID}"
+          RELEASE_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/${RELEASE_TAG}"
+
+          # Do not publish the (signed) source URL's query string in release notes
+          SRC_CLEAN="${INPUT_ROM_URL%%\?*}"
+
+          cat > build-info.txt <<EOF
+          GSI build report
+          ================
+          Output name: $INPUT_OUTPUT_NAME
+          Target device: Google Pixel 7 (panther, arm64, A/B, dynamic partitions)
+          Source: $SRC_CLEAN
+          Filesystem: $INPUT_FS_TYPE ($IMAGE_MODE)
+          Raw image size: $RAW_SIZE
+          eSIM: eUICC feature flag injected; requires an eUICC app in the image
+          Commit: $GITHUB_SHA
+          Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          Built at UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          Checksums:
+          $(cat SHA256SUMS.txt)
+          EOF
+
+          cat > release-notes.md <<EOF
+          ## ${INPUT_OUTPUT_NAME} - Pixel 7 GSI (eSIM)
+
+          - **Source**: $SRC_CLEAN
+          - **Filesystem**: $INPUT_FS_TYPE
+          - **Product**: stock Pixel 7 product.img + conservative GSI product merge
+          - **Raw image size**: $RAW_SIZE
+          - **Workflow run**: [$GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)
+
+          ### Flashing on Pixel 7 (bootloader must be unlocked, WIPES DATA)
+
+          Firmware bundle included in this release: **$HAS_BUNDLE**
+
+          1. Extract: \`xz -d ${INPUT_OUTPUT_NAME}.img.xz\`
+          2. If the bundle is present, unzip \`${INPUT_OUTPUT_NAME}-pixel7-firmware.zip\` and run
+             \`./flash_all.sh /path/to/${INPUT_OUTPUT_NAME}.img\`
+             (flashes stock kernel/boot chain, vbmeta with verification disabled, vendor
+             images, the GSI, then wipes data).
+          3. Without the bundle, do it manually: flash stock \`vbmeta.img\` with
+             \`--disable-verity --disable-verification\`, \`fastboot reboot fastboot\`,
+             \`fastboot flash system ${INPUT_OUTPUT_NAME}.img\`, \`fastboot -w\`, reboot.
+
+          If flashing fails with "not enough space", delete unused logical partitions
+          (e.g. \`fastboot delete-logical-partition product_a\`) and retry.
+
+          ### Product merge
+
+          The workflow uses the stock Pixel 7 product.img as the base, then adds only selected
+          non-duplicative GSI product overlays/configuration and missing product apps. It does not
+          bulk-replace framework jars, libraries, init files, or existing Pixel product apps.
+          The final system.img does not contain the GSI /system/product tree; that content is
+          placed into product-new.img so there is no /product/product nesting.
+
+          ### Kernel
+          A GSI contains no kernel. The Pixel 7 kernel lives in boot/vendor_boot/vendor_dlkm,
+          which the bundle takes from the stock factory image (or a custom boot.img if you
+          supplied one; custom kernels must match the vendor_dlkm modules).
+
+          ### Lock screen (PIN / pattern / fingerprint)
+          Lock screen credentials rely on the vendor KeyMint, Gatekeeper and Weaver HALs.
+          They break when the vendor firmware does not match the GSI, or when old encrypted
+          userdata is left on the device. Flash the matching vendor images and always wipe
+          (\`fastboot -w\`). The build log prints a vendor-vs-GSI compatibility check.
+
+          ### eSIM
+          Works only if the base build ships Google's eUICC app (the build checks this).
+          Add the eSIM from Settings > Network & internet > SIMs.
+          EOF
+
+          cat > telegram-message.html <<EOF
+          <b>${INPUT_OUTPUT_NAME} (Pixel 7 GSI)</b>
+          <a href="${RELEASE_URL}">Open GitHub Release</a>
+          Filesystem: ${INPUT_FS_TYPE} | Size: ${RAW_SIZE}
+          EOF
+
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+
+      - name: "📤 Upload to Actions Artifacts"
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ inputs.output_name }}
+          path: |
+            workspace/output/*.img.xz
+            workspace/output/*.zip
+            workspace/output/*-product-new.img.xz
+            workspace/output/SHA256SUMS.txt
+            workspace/output/build-info.txt
+          retention-days: 7
+
+      - name: "🏷️ Create GitHub Release"
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "${{ inputs.output_name }} (Pixel 7 GSI)"
+          body_path: workspace/output/release-notes.md
+          files: |
+            workspace/output/*.img.xz
+            workspace/output/*.zip
+            workspace/output/*-product-new.img.xz
+            workspace/output/SHA256SUMS.txt
+            workspace/output/build-info.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "📨 Sync release to Telegram"
+        if: success()
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram secrets not configured; skipping."
+            exit 0
+          fi
+          bash scripts/send_telegram_message.sh \
+            "$TELEGRAM_BOT_TOKEN" \
+            "$TELEGRAM_CHAT_ID" \
+            workspace/output/telegram-message.html
